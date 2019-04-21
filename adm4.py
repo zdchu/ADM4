@@ -1,9 +1,9 @@
 import numpy as np
-from utils import *
 import IPython
-from collections import defaultdict
-from tick.hawkes import HawkesADM4, SimuHawkesExpKernels, SimuHawkesMulti
-
+from utils import *
+import time as Time
+# from cython_utils import *
+from tick.hawkes import SimuHawkesExpKernels, SimuHawkesMulti
 
 class ADM4(object):
     def __init__(self, para):
@@ -15,100 +15,87 @@ class ADM4(object):
 
     def fit(self, mark_seq, time_seq):
         para = self.para
+        max_iter = para.max_iter
+        em_max_iter = para.em_max_iter
+        decay = para.decay
+        K = para.K
+        sparse = para.sparse
+        rho = para.rho
+        threshold = para.threshold
+        alpha = para.alpha
+
         T_start = time_seq[0]
-        T_stop = time_seq[-1]
+        T_stop = time_seq[-1] + 1
 
         dT = T_stop - time_seq
-        GK = kernel_integration(dT, para.decay)
+        GK = kernel_integration(dT, decay)
 
         Aest = self.A.copy()
         muest = self.mu.copy()
 
-        if para.low_rank:
-            UL = np.zeros_like(Aest)
-            ZL = Aest.copy()
+        gij = [np.array([0] * K)]
+        BmatA_raw = np.zeros_like(Aest)
+        for i in range(len(time_seq)):
+            time = time_seq[i]
+            mark = mark_seq[i]
+            BmatA_raw[:, mark] = BmatA_raw[:, mark] + [GK[i]] * K
+            if i > 0:
+                tj = time_seq[i-1]
+                uj = mark_seq[i-1]
+                gij_last = gij[-1].copy()
 
-        if para.sparse:
+                gij_now = (gij_last / decay) * decay * np.exp(-decay * (time - tj))
+                gij_now[uj] += decay * np.exp(-decay*(time - tj))
+
+                gij.append(gij_now)
+        gij_raw = np.array(gij)
+
+        if sparse:
             US = np.zeros_like(Aest)
             ZS = Aest.copy()
 
-        for o in range(para.max_iter):
-            rho = para.rho * (1.1 ** o)
-            for n in range(para.em_max_iter):
-                NLL = 0 # negative log-likelihood
-
+        for o in range(max_iter):
+            rho = rho * (1.1 ** o)
+            for n in range(em_max_iter):
                 Amu = np.zeros_like(muest)
                 Bmu = Amu.copy()
 
                 CmatA = np.zeros_like(Aest)
-                AmatA = CmatA.copy()
-                BmatA = CmatA.copy()
+                BmatA = BmatA_raw.copy()
 
-                if para.low_rank:
-                    BmatA = BmatA + rho * (UL -ZL)
-                    AmatA = AmatA + rho
-
-                if para.sparse:
+                if sparse:
                     BmatA = BmatA + rho * (US - ZS)
-                    AmatA = AmatA + rho
 
                 Amu = Amu + T_stop - T_start
+                gij = Aest[mark_seq] * gij_raw
+                gij = np.insert(gij, 0, values=muest[mark_seq], axis=1)
+                pij = gij / np.sum(gij, axis=1)[:, np.newaxis]
+                np.add.at(Bmu, mark_seq, pij[:, 0])
+                np.add.at(CmatA, mark_seq, -pij[:, 1:])
 
-                for i in range(len(mark_seq)):
-                    time = time_seq[i]
-                    mark = mark_seq[i]
-
-                    BmatA[:, mark] = BmatA[:, mark] + [GK[i]] * para.K
-
-                    lambdai = muest[mark]
-                    pii = muest[mark]
-                    pij = []
-                    if i > 1:
-                        tj = time_seq[:i]
-                        uj = mark_seq[:i]
-
-                        dt = time - tj
-                        gij = exp_kernel(dt, para.decay)
-
-                        auiuj = Aest[mark, uj]
-                        pij = auiuj * gij
-                        lambdai = lambdai + np.sum(pij)
-                    NLL = NLL - np.log(lambdai)
-                    pii = pii / lambdai
-
-                    if i > 1:
-                        pij = pij / lambdai
-                        if np.sum(pij) > 0:
-                            for j in range(len(uj)):
-                                uuj = uj[j]
-                                CmatA[mark, uuj] = CmatA[mark, uuj] - pij[j]
-                                # CmatA[uuj, mark] = CmatA[uuj, mark] - pij[j]
-                    Bmu[mark] = Bmu[mark] + pii
                 mu = Bmu / Amu
-                if para.sparse or para.low_rank:
+                if sparse:
                     A = (-BmatA + np.sqrt(np.square(BmatA) - 8 * rho * CmatA))/(4 * rho)
                 else:
                     A = -CmatA / BmatA
+
                 Err = np.sum(abs(A-Aest)) / np.sum(abs(Aest))
                 Aest = A.copy()
                 muest = mu.copy()
                 self.A = Aest.copy()
                 self.mu = muest.copy()
 
-                if Err < para.threshold:
+                if Err < threshold:
                     break
 
-            if para.sparse:
-                threshold = para.alpha / rho
+            if sparse:
+                threshold = alpha / rho
                 ZS = soft_thres_S(Aest+US, threshold)
                 US = US + Aest - ZS
 
 
 if __name__ == '__main__':
-    # test
-
-
-    end_time = 10000
+    end_time = 50000
     n_realizations = 1
     decay = 3
     baseline =np.ones(6) * .03
@@ -136,9 +123,5 @@ if __name__ == '__main__':
     type_seq = type_seq[np.argsort(time_seq)]
     time_seq = time_seq[np.argsort(time_seq)]
 
-    para = Parameters()
-
-    learner = ADM4(para)
-    learner.fit(mark_seq=type_seq, time_seq=time_seq)
+    para = Parameters(decay=3, K=6)
     IPython.embed()
-
